@@ -1,0 +1,22 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: cartwise-db
+    environment:
+      POSTGRES_USER: cartwise
+      POSTGRES_PASSWORD: cartwise_dev
+      POSTGRES_DB: cartwise
+    ports:
+      - "5433:5432"
+    volumes:
+      - cartwise_pgdata:/var/lib/postgresql/data
+      # schema.sql runs automatically on FIRST container start (empty volume only)
+      - ./data/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cartwise -d cartwise"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  cartwise_pgdata:
