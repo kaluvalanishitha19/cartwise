@@ -56,7 +56,7 @@ CREATE TABLE policy_chunks (
   doc_title TEXT NOT NULL,
   chunk_text TEXT NOT NULL,
   chunk_index INT NOT NULL,
-  embedding vector(1536)
+  embedding vector(384)
 );
 
 CREATE INDEX idx_orders_customer ON orders(customer_id);
