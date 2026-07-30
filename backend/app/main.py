@@ -174,7 +174,11 @@ DELIVERY_CONCERN_EXAMPLES = [
     "I think someone unauthorized has access to my delivery address",
     "the driver behaved inappropriately or made me feel unsafe",
 ]
-SAFETY_DISTANCE_THRESHOLD = 0.55  # below this = close enough to count as a match
+SAFETY_DISTANCE_THRESHOLD = 0.42  # below this = close enough to count as a match
+# Tuned from measured distances: genuine concerns measured 0.22-0.40, while
+# an innocent "is my package lost?" question measured 0.45 -- 0.42 sits in
+# the gap between them, with margin on both sides (see
+# evals/diagnose_safety_threshold.py).
 
 _safety_embeddings = None  # computed once at startup, see below
 
