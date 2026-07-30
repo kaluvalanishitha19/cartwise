@@ -16,6 +16,8 @@ Then test with:
 import os
 import re
 
+import numpy as np
+
 import ollama
 import psycopg2
 from fastapi import FastAPI
@@ -153,6 +155,67 @@ def lookup_order(order_id: int) -> str | None:
     return "\n".join(lines)
 
 
+# Example phrases representing safety/privacy concerns. We check if the
+# customer's message is semantically close to any of these -- same idea
+# as policy search, just matching against a small set of examples instead
+# of documents. Anything that clears the threshold gets escalated, not
+# answered automatically.
+SAFETY_CONCERN_EXAMPLES = [
+    "this product caught fire or started smoking",
+    "the item shocked me or gave me an electric shock",
+    "I got injured or hurt using this product",
+    "this item is leaking a dangerous chemical or gas",
+    "the product exploded or the battery swelled up",
+]
+DELIVERY_CONCERN_EXAMPLES = [
+    "the delivery driver was following me or acting suspicious",
+    "someone took a photo of my house or seemed to be watching me",
+    "my package was left somewhere unsafe or in plain view for strangers",
+    "I think someone unauthorized has access to my delivery address",
+    "the driver behaved inappropriately or made me feel unsafe",
+]
+SAFETY_DISTANCE_THRESHOLD = 0.55  # below this = close enough to count as a match
+
+_safety_embeddings = None  # computed once at startup, see below
+
+
+def check_safety_concern(message: str) -> tuple[bool, str | None]:
+    """
+    Returns (True, category) if the message is close in meaning to a
+    safety or delivery-privacy concern example, else (False, None).
+    """
+    global _safety_embeddings
+    if _safety_embeddings is None:
+        _safety_embeddings = {
+            "safety_concern": embed_model.encode(SAFETY_CONCERN_EXAMPLES),
+            "delivery_privacy_concern": embed_model.encode(DELIVERY_CONCERN_EXAMPLES),
+        }
+
+    message_embedding = embed_model.encode(message)
+    for category, examples_embedding in _safety_embeddings.items():
+        # cosine distance = 1 - cosine similarity
+        sims = np.dot(examples_embedding, message_embedding) / (
+            np.linalg.norm(examples_embedding, axis=1) * np.linalg.norm(message_embedding)
+        )
+        best_distance = 1 - sims.max()
+        if best_distance < SAFETY_DISTANCE_THRESHOLD:
+            return True, category
+    return False, None
+
+
+def create_escalation(order_id: int | None, reason: str, customer_message: str, agent_note: str) -> None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO escalations (order_id, reason, customer_message, agent_note) "
+        "VALUES (%s, %s, %s, %s)",
+        (order_id, reason, customer_message, agent_note),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
 # Orders in these statuses can no longer be cancelled -- the item is either
 # already with the customer or already handled. This is a real business
 # rule, not just a technicality: it's what returns/refunds are for instead.
@@ -238,6 +301,12 @@ def initiate_refund(order_id: int) -> dict:
     if total_cents > LARGE_REFUND_THRESHOLD_CENTS:
         cur.close()
         conn.close()
+        create_escalation(
+            order_id=order_id,
+            reason="large_refund",
+            customer_message=f"Refund requested for order #{order_id} (${total_cents / 100:.2f})",
+            agent_note=f"Order total ${total_cents / 100:.2f} exceeds the $150 automatic refund limit.",
+        )
         return {
             "success": False,
             "reason": f"This order totals ${total_cents / 100:.2f}, which is over our $150 "
@@ -265,8 +334,74 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/escalations")
+def list_escalations():
+    """
+    Returns all open escalations, most recent first -- what a human
+    support agent would see when they open the dashboard.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, order_id, reason, customer_message, agent_note, status, created_at
+        FROM escalations
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [
+        {
+            "id": r[0],
+            "order_id": r[1],
+            "reason": r[2],
+            "customer_message": r[3],
+            "agent_note": r[4],
+            "status": r[5],
+            "created_at": r[6].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/escalations/{escalation_id}/resolve")
+def resolve_escalation(escalation_id: int):
+    """
+    Marks an escalation as resolved -- the human agent clicking
+    "resolved" after they've handled the case.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE escalations SET status = 'resolved' WHERE id = %s", (escalation_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"status": "ok"}
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
+    # Step -1: safety/privacy concerns take priority over everything else,
+    # even an in-progress confirmation flow. Never handled automatically.
+    is_concern, category = check_safety_concern(req.message)
+    if is_concern:
+        order_match = ORDER_ID_PATTERN.search(req.message)
+        order_id = int(order_match.group(1) or order_match.group(2)) if order_match else None
+        create_escalation(
+            order_id=order_id,
+            reason=category,
+            customer_message=req.message,
+            agent_note=f"Auto-flagged as {category.replace('_', ' ')} -- needs human review, not answered automatically.",
+        )
+        return ChatResponse(
+            reply="I'm really sorry to hear that. This isn't something I can resolve automatically -- "
+                  "I've flagged it for our support team right away, and someone will follow up with you directly.",
+            sources=[],
+        )
+
     # Step 0: is this a reply to a pending "are you sure?" question?
     if req.pending_action and req.pending_action.get("action") == "cancel":
         order_id = req.pending_action["order_id"]
