@@ -71,7 +71,8 @@ ORDER_ID_PATTERN = re.compile(r"order\s*(?:id\s*)?#?\s*(\d+)|#(\d+)", re.IGNOREC
 
 # Simple keyword check for "the customer wants to cancel something".
 CANCEL_INTENT_PATTERN = re.compile(r"\bcancel\b", re.IGNORECASE)
-CONFIRM_PATTERN = re.compile(r"\b(yes|confirm|do it|go ahead|please cancel)\b", re.IGNORECASE)
+REFUND_INTENT_PATTERN = re.compile(r"\brefund\b", re.IGNORECASE)
+CONFIRM_PATTERN = re.compile(r"\b(yes|confirm|do it|go ahead|please cancel|please refund)\b", re.IGNORECASE)
 
 
 class ChatRequest(BaseModel):
@@ -197,6 +198,68 @@ def cancel_order(order_id: int) -> dict:
     return {"success": True, "reason": f"Order #{order_id} has been cancelled."}
 
 
+# Per our refunds policy: only items actually returned and inspected are
+# refund-eligible. "No damage" isn't a database fact -- it's confirmed
+# through the conversation itself, same as a real support agent would.
+REFUND_ELIGIBLE_STATUSES = {"returned"}
+
+# From refunds.md: refunds over $150 need manual review before they can
+# be issued. We don't have a human escalation queue yet (that's next),
+# so for now the agent is honest about the limit instead of pretending
+# to process something it can't actually approve.
+LARGE_REFUND_THRESHOLD_CENTS = 15000
+
+
+def initiate_refund(order_id: int) -> dict:
+    """
+    The agent's third tool: issue a refund, IF the order is eligible.
+    Returns a dict describing what happened -- success, or why not.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status, total_cents FROM orders WHERE id = %s", (order_id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.close()
+        conn.close()
+        return {"success": False, "reason": f"No order found with ID #{order_id}."}
+
+    status, total_cents = row
+    if status not in REFUND_ELIGIBLE_STATUSES:
+        cur.close()
+        conn.close()
+        return {
+            "success": False,
+            "reason": f"Order #{order_id} is currently '{status}'. Refunds can only be issued "
+                      f"once an item has been returned and received at our warehouse.",
+        }
+
+    if total_cents > LARGE_REFUND_THRESHOLD_CENTS:
+        cur.close()
+        conn.close()
+        return {
+            "success": False,
+            "reason": f"This order totals ${total_cents / 100:.2f}, which is over our $150 "
+                      f"automatic refund limit. This needs manual review by our support team "
+                      f"before it can be issued -- I've flagged it for a human agent.",
+        }
+
+    cur.execute(
+        "INSERT INTO order_events (order_id, event_type, detail, occurred_at) "
+        "VALUES (%s, 'refund_issued', 'Refund issued via support chat after damage confirmation.', now())",
+        (order_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {
+        "success": True,
+        "reason": f"Your refund of ${total_cents / 100:.2f} for order #{order_id} has been issued "
+                  f"to your original payment method. It typically takes 7-10 business days to appear.",
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -204,7 +267,7 @@ def health():
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    # Step 0: is this a reply to a pending "are you sure you want to cancel?"
+    # Step 0: is this a reply to a pending "are you sure?" question?
     if req.pending_action and req.pending_action.get("action") == "cancel":
         order_id = req.pending_action["order_id"]
         if CONFIRM_PATTERN.search(req.message):
@@ -216,10 +279,38 @@ def chat(req: ChatRequest):
                 sources=[],
             )
 
+    if req.pending_action and req.pending_action.get("action") == "refund_damage_check":
+        order_id = req.pending_action["order_id"]
+        if CONFIRM_PATTERN.search(req.message):
+            # Damage confirmed as none -- now ask for the final refund confirmation.
+            return ChatResponse(
+                reply=f"Got it, thanks. Just to confirm -- process the refund for order #{order_id}? "
+                      f"Reply 'yes' to confirm.",
+                sources=[],
+                pending_action={"action": "refund", "order_id": order_id},
+            )
+        else:
+            return ChatResponse(
+                reply=f"I understand -- since the item wasn't returned in undamaged condition, "
+                      f"I can't process an automatic refund for order #{order_id}. "
+                      f"I've flagged this for a human agent to review.",
+                sources=[],
+            )
+
+    if req.pending_action and req.pending_action.get("action") == "refund":
+        order_id = req.pending_action["order_id"]
+        if CONFIRM_PATTERN.search(req.message):
+            result = initiate_refund(order_id)
+            return ChatResponse(reply=result["reason"], sources=[f"Order #{order_id} refund"])
+        else:
+            return ChatResponse(
+                reply=f"Okay, I won't process a refund for order #{order_id}. Anything else I can help with?",
+                sources=[],
+            )
+
     order_match = ORDER_ID_PATTERN.search(req.message)
 
-    # Step 1: does this message mention BOTH an order AND the word "cancel"?
-    # If so, don't cancel yet -- ask for confirmation first.
+    # Step 1: order + "cancel" -- ask for confirmation before acting.
     if order_match and CANCEL_INTENT_PATTERN.search(req.message):
         order_id = int(order_match.group(1) or order_match.group(2))
         return ChatResponse(
@@ -229,7 +320,19 @@ def chat(req: ChatRequest):
             pending_action={"action": "cancel", "order_id": order_id},
         )
 
-    # Step 2: an order ID with no cancel intent -- treat as a lookup.
+    # Step 2: order + "refund" -- first confirm the item arrived undamaged
+    # (our refunds policy requires this before any refund is eligible),
+    # THEN ask to confirm the refund itself.
+    if order_match and REFUND_INTENT_PATTERN.search(req.message):
+        order_id = int(order_match.group(1) or order_match.group(2))
+        return ChatResponse(
+            reply=f"Before I can process a refund for order #{order_id}, can you confirm the "
+                  f"returned item arrived at our warehouse with no damage? Reply 'yes' to confirm.",
+            sources=[],
+            pending_action={"action": "refund_damage_check", "order_id": order_id},
+        )
+
+    # Step 3: an order ID with no cancel/refund intent -- treat as a lookup.
     if order_match:
         order_id = int(order_match.group(1) or order_match.group(2))
         timeline = lookup_order(order_id)
@@ -250,7 +353,7 @@ def chat(req: ChatRequest):
         )
         return ChatResponse(reply=response["message"]["content"], sources=[f"Order #{order_id} history"])
 
-    # Step 3: no order ID mentioned -- treat as a policy question (RAG, as before).
+    # Step 4: no order ID mentioned -- treat as a policy question (RAG, as before).
     chunks = retrieve_chunks(req.message)
     context, sources = build_context(chunks)
 
