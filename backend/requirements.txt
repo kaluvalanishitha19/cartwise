@@ -12,4 +12,4 @@ numpy==1.26.4
 ollama==0.3.3
 
 # MCP server (backend/app/mcp_server.py)
-mcp[cli]==2.1.1
+mcp[cli]==2.1.1groq
