@@ -1,3 +1,15 @@
-# Day 1: seeding only. FastAPI/LangGraph stack gets added as we build.
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.10
 Faker==26.0.0
+
+# API layer
+fastapi==0.115.0
+uvicorn[standard]>=0.31.0  # mcp[cli] 2.1.1 pulls in a newer uvicorn
+pydantic>=2.12.0  # mcp[cli] 2.1.1 requires >=2.12.0
+
+# RAG / embeddings / LLM
+sentence-transformers==3.1.1
+numpy==1.26.4
+ollama==0.3.3
+
+# MCP server (backend/app/mcp_server.py)
+mcp[cli]==2.1.1
